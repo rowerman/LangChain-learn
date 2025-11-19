@@ -17,20 +17,20 @@ from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 from langchain.tools import tool
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import GitLoader, DirectoryLoader
 from langchain_community.chat_message_histories import FileChatMessageHistory
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_classic.chains import create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 
 # --- Local Utility Imports (assumed to be correct) ---
 try:
     # Assuming these are available in the path
-    from recon_agent import ReconAgent
+    from recon_agent_new import ReconAgent
     from utils.prompt import PentestAgentPrompt
 except ImportError as e:
     print(f"Error importing local utils: {e}. Make sure your PYTHONPATH is set correctly.")
@@ -38,15 +38,39 @@ except ImportError as e:
 
 
 # --- Configuration and Logging Setup ---
+import logging
+import sys
+import dotenv
+
 dotenv.load_dotenv()
-logging.basicConfig(
-    filename='execution_agent_v2.log',
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    level=logging.INFO,
-    handlers=[logging.StreamHandler(sys.stdout)] # Log to both file and console
+
+# 1. 获取根日志记录器 (root logger)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)  # 设置日志记录的最低级别
+
+# 2. 清除任何可能已存在的处理器，以避免重复输出日志
+if logger.hasHandlers():
+    logger.handlers.clear()
+
+# 3. 创建一个通用的日志格式，供所有处理器使用
+log_formatter = logging.Formatter(
+    fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
+
+# 4. 创建一个文件处理器 (FileHandler) 并添加到 logger
+file_handler = logging.FileHandler('execution_agent_v2.log')
+file_handler.setFormatter(log_formatter)
+logger.addHandler(file_handler)
+
+# 5. 创建一个流处理器 (StreamHandler) 用于输出到控制台，并添加到 logger
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setFormatter(log_formatter)
+logger.addHandler(stream_handler)
+
+# 6. 获取当前模块的日志记录器，它将继承上面的设置
 logger = logging.getLogger(__name__)
+
 
 try:
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'configs', 'config.yaml')
@@ -63,8 +87,7 @@ except Exception as e:
 # The agent will have access to these functions. The docstrings are crucial
 # as they tell the LLM when and how to use the tool.
 
-@tool
-def run_shell_command(command: str, path: str) -> str:
+def _run_shell_command_logic(command: str, path: str) -> str:
     """
     Executes a shell command in a specified directory and returns its output.
     Use this to run exploit scripts, list files, or interact with the system.
@@ -152,12 +175,16 @@ class ExecutionAgent:
             response = retrieval_chain.invoke({"input": query})
             return response['answer']
 
-        # 3. Combine all tools
-        # We need to bind the `path` argument for the shell tool
-        bound_shell_tool = lambda command: run_shell_command(command=command, path=self.doc_dir)
-        bound_shell_tool.__doc__ = run_shell_command.__doc__ # Preserve docstring for the agent
-        
-        return [query_exploit_documentation, tool(name="run_shell_command")(bound_shell_tool)]
+        # ...
+        # 现在我们调用的是一个真正的 Python 函数，不会再有错误了
+        bound_shell_tool = lambda command: _run_shell_command_logic(command=command, path=self.doc_dir)
+        # 从原始逻辑函数复制文档字符串，以便 LLM 理解
+        bound_shell_tool.__doc__ = _run_shell_command_logic.__doc__ 
+
+        # 将我们绑定好参数的 lambda 函数包装成一个 LLM 可以使用的工具
+        shell_command_tool = tool("run_shell_command")(bound_shell_tool)
+
+        return [query_exploit_documentation, shell_command_tool]
         
     def _create_agent_executor(self):
         """Builds the agent executor using LangChain Expression Language (LCEL)."""
@@ -230,8 +257,7 @@ def main():
     if execution_config.get('current_topic'):
         recon_agent = ReconAgent()
         query_msg = f"Based on the known information, try to provide the information needed listed here:\n{res1}"
-        recon_agent.send_message(execution_config['current_topic'], query_msg)
-        recon_res = recon_agent.run_thread(execution_config['current_topic'])
+        recon_res = recon_agent.run(topic=execution_config['current_topic'], user_input=query_msg)
         if recon_res:
             logger.info(f"Reconnaissance agent response:\n{recon_res}")
         else:
