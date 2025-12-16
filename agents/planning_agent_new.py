@@ -101,16 +101,23 @@ def cvemap_product(product: str, output_dir: str, cvemap_cfg: Dict) -> List[Dict
     max_entries = cvemap_cfg.get("max_entry")
     min_year = cvemap_cfg.get("min_year")
     max_year = cvemap_cfg.get("max_year")
+    # 添加最大 offset 限制，防止无限循环
+    max_offset = 10000  # 设置一个合理的上限
 
     logger.info(f"Starting vulnx search for product '{lower_product}'...")
 
     while True:
         if max_entries and len(all_results) >= max_entries:
             break
+        
+        # 检查 offset 是否超过最大限制
+        if offset >= max_offset:
+            logger.warning(f"Reached maximum offset limit ({max_offset}). Stopping search.")
+            break
 
+        # 使用产品名作为位置参数，而不是 -p 参数
         vulnx_command = [
-            "vulnx", "search",
-            "-p", lower_product,
+            "vulnx", "search", lower_product,
             "-n", str(limit),
             "--offset", str(offset),
             "--detailed",
@@ -138,6 +145,9 @@ def cvemap_product(product: str, output_dir: str, cvemap_cfg: Dict) -> List[Dict
                 logger.info("vulnx returned a response with an empty 'results' list. Ending search.")
                 break
 
+            # 记录本次获取到的原始结果数量
+            batch_size_before_filter = len(current_batch)
+
             # 3. 遍历这个包含 CVE 详细信息的字典列表
             for cve_item in current_batch:
                 # 确保 cve_item 是字典并且包含 'cve_id'
@@ -161,7 +171,15 @@ def cvemap_product(product: str, output_dir: str, cvemap_cfg: Dict) -> List[Dict
                 if max_entries and len(all_results) >= max_entries:
                     break
             
-            if len(current_batch) < limit or (max_entries and len(all_results) >= max_entries):
+            # 改进的终止条件：
+            # 1. 如果返回的结果数量小于 limit，说明已经到达末尾
+            # 2. 如果已经达到最大条目数，停止
+            # 3. 如果 offset > 0 且返回结果为空，说明已经到达末尾
+            if batch_size_before_filter < limit:
+                logger.info(f"Received {batch_size_before_filter} results (less than limit {limit}). No more pages available.")
+                break
+            
+            if max_entries and len(all_results) >= max_entries:
                 break
                 
             offset += limit
@@ -209,23 +227,107 @@ def main():
     
     logger.info(f"Starting planning agent for App: '{app}', Version: '{version or 'any'}'")
 
-    # 3. Run external tools to gather data
-    cvemap_res_dir = os.path.join(res_dir, "CVEMAP")
-    cvemap_results = cvemap_product(app.lower().replace(' ', '_'), cvemap_res_dir, cvemap_config)
+    # 3. Check if a specific CVE is specified
+    specific_cve = cvemap_config.get('specific_cve')
     
-    # 4. Filter data based on logic
-    if version:
-        logger.info(f"Filtering CVEs for version '{version}'. Note: This may not be perfectly accurate.")
-        limited_lst = get_affected_cve(cvemap_results, version)
-        cve_ids = [item['cve_id'] for item in limited_lst]
-        logger.info(f"Found {len(cve_ids)} CVEs potentially affecting version {version}: {cve_ids}")
+    if specific_cve:
+        # 如果指定了具体的 CVE，直接使用该 CVE，跳过 vulnx 搜索
+        logger.info(f"Specific CVE specified: {specific_cve}. Skipping vulnx search.")
+        
+        # 验证 CVE 格式
+        if not specific_cve.upper().startswith('CVE-'):
+            logger.warning(f"Invalid CVE format: {specific_cve}. Expected format: CVE-YYYY-NNNNN")
+            return
+        
+        # 应用年份过滤（如果配置了）
+        min_year = cvemap_config.get('min_year')
+        max_year = cvemap_config.get('max_year')
+        
+        try:
+            cve_year = int(specific_cve.split('-')[1])
+            if (max_year and cve_year > max_year) or (min_year and cve_year < min_year):
+                logger.warning(f"CVE {specific_cve} (year: {cve_year}) is outside the configured year range "
+                             f"(min_year: {min_year}, max_year: {max_year}). Exiting.")
+                return
+        except (IndexError, ValueError) as e:
+            logger.warning(f"Failed to extract year from CVE {specific_cve}: {e}")
+            return
+        
+        # 如果指定了版本，需要先获取 CVE 描述信息以进行版本过滤
+        cve_ids = [specific_cve.upper()]
+        
+        # 为了进行版本过滤，需要先获取 CVE 描述信息
+        if version:
+            logger.info(f"Version specified ({version}). Fetching CVE description for version filtering...")
+            # 导入 cvemap_search 函数以获取 CVE 描述
+            from utils.cve_info import cvemap_search
+            cvemap_res_dir = os.path.join(res_dir, "CVEMAP")
+            os.makedirs(cvemap_res_dir, exist_ok=True)
+            info_dir = os.path.join(cvemap_res_dir, "info")
+            os.makedirs(info_dir, exist_ok=True)
+            
+            # 获取 CVE 详细信息
+            cvemap_json = cvemap_search(specific_cve.upper(), info_dir)
+            if cvemap_json is None:
+                logger.warning(f"Failed to fetch CVE description for {specific_cve}. Skipping version filter.")
+                cvemap_results = [{'cve_id': specific_cve.upper()}]
+            else:
+                # 提取 CVE 描述信息
+                results_list = cvemap_json.get('results', [])
+                if results_list and len(results_list) > 0:
+                    cve_details = results_list[0]
+                    cve_description = cve_details.get('description', 'No description available.')
+                    cvemap_results = [{
+                        'cve_id': specific_cve.upper(),
+                        'cve_description': cve_description
+                    }]
+                    logger.info(f"Fetched CVE description for version filtering.")
+                else:
+                    logger.warning(f"Could not extract CVE description. Skipping version filter.")
+                    cvemap_results = [{'cve_id': specific_cve.upper()}]
+        else:
+            # 如果没有指定版本，直接使用 CVE ID
+            cvemap_results = [{'cve_id': specific_cve.upper()}]
+            logger.info(f"Using specific CVE: {cve_ids[0]} (no version filter)")
+        
+        # 保存到 CVEMAP 目录以保持一致性
+        cvemap_res_dir = os.path.join(res_dir, "CVEMAP")
+        os.makedirs(cvemap_res_dir, exist_ok=True)
+        vulnx_json_path = os.path.join(cvemap_res_dir, "vulnx.json")
+        with open(vulnx_json_path, "w", encoding="utf-8") as f:
+            json.dump(cvemap_results, f, indent=2)
+        
+        # 如果指定了版本，进行版本过滤
+        if version and 'cve_description' in cvemap_results[0]:
+            logger.info(f"Filtering specific CVE for version '{version}'. Note: This may not be perfectly accurate.")
+            limited_lst = get_affected_cve(cvemap_results, version)
+            if limited_lst:
+                cve_ids = [item['cve_id'] for item in limited_lst]
+                logger.info(f"Specific CVE {specific_cve} affects version {version}. Proceeding with analysis.")
+            else:
+                logger.warning(f"Specific CVE {specific_cve} does not appear to affect version {version} based on description analysis.")
+                logger.info(f"However, since a specific CVE was explicitly requested, proceeding with analysis anyway.")
+                # 继续处理，因为用户明确指定了该 CVE
+        elif version:
+            logger.info(f"Version specified but CVE description unavailable. Proceeding with specific CVE analysis.")
     else:
-        logger.info("No version constraint set. Using all found CVEs.")
-        cve_ids = [item["cve_id"] for item in cvemap_results]
+        # 原有的逻辑：使用 vulnx 搜索 CVE
+        cvemap_res_dir = os.path.join(res_dir, "CVEMAP")
+        cvemap_results = cvemap_product(app.lower().replace(' ', '_'), cvemap_res_dir, cvemap_config)
+        
+        # 4. Filter data based on logic
+        if version:
+            logger.info(f"Filtering CVEs for version '{version}'. Note: This may not be perfectly accurate.")
+            limited_lst = get_affected_cve(cvemap_results, version)
+            cve_ids = [item['cve_id'] for item in limited_lst]
+            logger.info(f"Found {len(cve_ids)} CVEs potentially affecting version {version}: {cve_ids}")
+        else:
+            logger.info("No version constraint set. Using all found CVEs.")
+            cve_ids = [item["cve_id"] for item in cvemap_results]
 
-    if not cve_ids:
-        logger.warning("No relevant CVEs found after filtering. Exiting.")
-        return
+        if not cve_ids:
+            logger.warning("No relevant CVEs found after filtering. Exiting.")
+            return
 
     # 5. Process data with more tools/scripts
     exploit_searching_time, exploit_analysis_time = get_exp_info(cve_ids, res_dir, app)

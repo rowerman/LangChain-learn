@@ -1,6 +1,7 @@
 import re
 from utils.prompt import PentestAgentPrompt
 import time
+from langchain_core.messages import HumanMessage
 
 def split_result(text):
     sections = re.split(r'\[(.*?)\]', text)
@@ -30,7 +31,7 @@ def get_final_scr(result):
 
     return score
 
-def judge(query_engine, query_string, voters, results, opinions, confidences, case_constraint = False):
+def judge(llm, query_string, context, voters, results, opinions, confidences, case_constraint = False):
     # "Here are the details of each voter:..."
     judge_query = PentestAgentPrompt.base_judge_query_1
     # judge_query = "The security assistants performed a scan based on the following instructions:" + \
@@ -40,7 +41,14 @@ def judge(query_engine, query_string, voters, results, opinions, confidences, ca
         judge_query = judge_query + f"voter {i + 1}'s thought: {'True' if results[i] else 'False'}.\n" + f"His analysis is: {opinions[i]}\n\n\n"
     judge_query = judge_query + PentestAgentPrompt.base_judge_query_2
     # print(judge_query)
-    result = str(query_engine.query(judge_query))
+    # 构建完整的 prompt，包含上下文
+    if context:
+        full_prompt = f"{context}\n\n{judge_query}"
+    else:
+        full_prompt = judge_query
+    # 使用 LangChain ChatOpenAI 直接调用
+    response = llm.invoke([HumanMessage(content=full_prompt)])
+    result = str(response.content)
     # print(result)
     extracted_res = split_result(result)
 
@@ -52,7 +60,7 @@ def judge(query_engine, query_string, voters, results, opinions, confidences, ca
     return final_jdg
 
 
-def vote(query_engine, query_string, vote_base = 1, no_vote = 3, opn_weight = 0.5, compulsory_multi = False, case_constraint = False, use_judge = False, dictatorship = True): # no_vote range is [0, 5]
+def vote(llm, query_string, context="", vote_base = 1, no_vote = 3, opn_weight = 0.5, compulsory_multi = False, case_constraint = False, use_judge = False, dictatorship = True): # no_vote range is [0, 5]
     # if confidence score is low then vote
     voters = vote_base * 2 + 1
     results = []
@@ -60,7 +68,15 @@ def vote(query_engine, query_string, vote_base = 1, no_vote = 3, opn_weight = 0.
     confidences = []
     true_score = 0
     
-    result = str(query_engine.query(query_string))
+    # 构建完整的 prompt，包含上下文
+    if context:
+        full_prompt = f"{context}\n\n{query_string}"
+    else:
+        full_prompt = query_string
+    
+    # 使用 LangChain ChatOpenAI 直接调用
+    response = llm.invoke([HumanMessage(content=full_prompt)])
+    result = str(response.content)
     # if query_string == PentestAgentPrompt.code_attack_probability_query:
     # print(result)
     extracted_res = split_result(result)
@@ -85,7 +101,9 @@ def vote(query_engine, query_string, vote_base = 1, no_vote = 3, opn_weight = 0.
 
         for i in range(voters - 1):
             time.sleep(5) # avoid having similar results due to being processed in the same batch, maybe still too small based on current situation
-            result = str(query_engine.query(query_string))
+            # 使用 LangChain ChatOpenAI 直接调用
+            response = llm.invoke([HumanMessage(content=full_prompt)])
+            result = str(response.content)
             # if query_string == PentestAgentPrompt.code_attack_probability_query:
             # print(result)
             extracted_res = split_result(result)
@@ -104,7 +122,7 @@ def vote(query_engine, query_string, vote_base = 1, no_vote = 3, opn_weight = 0.
         if use_judge and not (all(results) or not any(results)): # default not use judgement, even when voters get same result
         # if use_judge and (all(results) or not any(results)): # activate this in test to match condition more easily
         # if use_judge:
-            judgement = judge(query_engine, query_string, voters, results, opinions, confidences)
+            judgement = judge(llm, query_string, context, voters, results, opinions, confidences)
 
             if dictatorship: # default use judger's opinion completely
                 return judgement, min(confidences)

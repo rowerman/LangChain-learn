@@ -4,10 +4,17 @@ import tiktoken
 from llama_index.core.callbacks import CallbackManager, TokenCountingHandler
 from utils.doc_handler import DocHandler
 from llama_index.llms.openai import OpenAI
-# from llama_index.llms.langchain import LangChainLLM
 from llama_index.llms.huggingface import HuggingFaceLLM
 from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
 from llama_index.core import Settings
+# 使用 LangChain 1.0 的 ChatOpenAI，和 recon_agent_new.py 保持一致
+from langchain_openai import ChatOpenAI
+# 使用 LangChainLLM 包装器使 LangChain 的 LLM 兼容 LlamaIndex
+try:
+    from llama_index.llms.langchain import LangChainLLM
+except ImportError:
+    # 如果导入失败，说明版本不兼容，使用备用方案
+    LangChainLLM = None
 import subprocess
 import os
 import openai
@@ -480,32 +487,76 @@ def cve_classifier(cve, output_dir="resources/", mode = "specific"):
     trending_score_path = f"{output_dir}/{cve}/Trend_Score.json"
     feature_path = f"{output_dir}/{cve}/features.json"
     cvemap_path = f"{output_dir}/{cve}/info/cvemap.json"
+    
+    # 检查必要文件是否存在
+    if not os.path.exists(feature_path):
+        logging.error(f"Features file not found for {cve}: {feature_path}")
+        raise FileNotFoundError(f"Features file not found for {cve}")
+    
     result = None
-    with open(feature_path, 'r') as f:
-        result = json.load(f)
+    try:
+        with open(feature_path, 'r') as f:
+            result = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        logging.error(f"Failed to read features file for {cve}: {e}")
+        raise
+    
     trending_score = 0
-    if result['code'].get('GitHub'):
+    if result.get('code', {}).get('GitHub'):
         try:
             with open(trending_score_path, 'r') as f:
                 _trending_score = json.load(f)
                 # print(trending_score)
                 trending_score = min(_trending_score.get("trend_score", 0), 50)
-        except:
+        except (FileNotFoundError, json.JSONDecodeError, IOError):
             logging.warning(f"Trending score not found for {cve}")
     else:
         trending_score = 999
 
     if mode == "specific":
         cvemap_json = None
-        with open(cvemap_path, 'r') as f:
-            cvemap_json = json.load(f)[0]
-        cvss_score = cvemap_json.get('cvss_score', 0)
-        epss_score = cvemap_json['epss']['epss_score']
-        epss_percentile = cvemap_json['epss']['epss_percentile']
+        if not os.path.exists(cvemap_path):
+            logging.error(f"CVEMAP file not found for {cve}: {cvemap_path}")
+            raise FileNotFoundError(f"CVEMAP file not found for {cve}")
+        
+        try:
+            with open(cvemap_path, 'r') as f:
+                cvemap_data = json.load(f)
+                # 处理不同的 JSON 格式：可能是列表或字典
+                if isinstance(cvemap_data, list):
+                    if len(cvemap_data) > 0:
+                        cvemap_json = cvemap_data[0]
+                    else:
+                        logging.error(f"CVEMAP file for {cve} contains an empty list")
+                        raise ValueError(f"CVEMAP file for {cve} contains an empty list")
+                elif isinstance(cvemap_data, dict):
+                    # 如果是字典，检查是否有 'results' 键
+                    if 'results' in cvemap_data and isinstance(cvemap_data['results'], list) and len(cvemap_data['results']) > 0:
+                        cvemap_json = cvemap_data['results'][0]
+                    else:
+                        # 直接使用字典本身
+                        cvemap_json = cvemap_data
+                else:
+                    logging.error(f"Unexpected CVEMAP data format for {cve}: {type(cvemap_data)}")
+                    raise ValueError(f"Unexpected CVEMAP data format for {cve}")
+        except (json.JSONDecodeError, IOError, KeyError, IndexError, ValueError) as e:
+            logging.error(f"Failed to parse CVEMAP file for {cve}: {e}")
+            raise
+        
+        # 安全地获取 CVSS 和 EPSS 分数
+        cvss_score = cvemap_json.get('cvss_score', 0) if cvemap_json else 0
+        epss_data = cvemap_json.get('epss', {}) if cvemap_json else {}
+        epss_score = epss_data.get('epss_score', 0) if isinstance(epss_data, dict) else 0
+        epss_percentile = epss_data.get('epss_percentile', 0) if isinstance(epss_data, dict) else 0
     elif mode == "general":
         cvss_score = 0
         epss_score = 0
         epss_percentile = 0
+    else:
+        cvss_score = 0
+        epss_score = 0
+        epss_percentile = 0
+    
     cvss_category = categorize_cvss(cvss_score)
     epss_category = categorize_epss(epss_percentile)
 
@@ -521,18 +572,22 @@ def cve_classifier(cve, output_dir="resources/", mode = "specific"):
             exploitability = "hard"
     
 
-    with open(f"{output_dir}/{cve}/classification.json", 'w') as f:
-        classification = {
-            "cvss_category": cvss_category,
-            "epss_category": epss_category,
-            "exploitability": exploitability,
-            "final_score": final_score,
-            "max_score_repo": max_score_repo,
-            "max_score": max_score,
-            "scores": scores,
-            "has_code": has_code
-        }
-        json.dump(classification, f, indent=4)
+    try:
+        with open(f"{output_dir}/{cve}/classification.json", 'w') as f:
+            classification = {
+                "cvss_category": cvss_category,
+                "epss_category": epss_category,
+                "exploitability": exploitability,
+                "final_score": final_score,
+                "max_score_repo": max_score_repo,
+                "max_score": max_score,
+                "scores": scores,
+                "has_code": has_code
+            }
+            json.dump(classification, f, indent=4)
+    except IOError as e:
+        logging.error(f"Failed to write classification file for {cve}: {e}")
+        raise
 
     return cvss_score, cvss_category, epss_percentile, epss_category, final_score, exploitability, has_code
 
@@ -582,7 +637,12 @@ def cve_analysis(cve, output_dir="resources/"):
     doc_handler = DocHandler()
 
     analysis_start_time = time.time()
-    result = doc_handler.vul_analysis(cve, output_dir, cve_description)
+    try:
+        result = doc_handler.vul_analysis(cve, output_dir, cve_description)
+    except Exception as e:
+        logging.error(f"Failed to analyze {cve} during vul_analysis (download/search may have failed): {e}")
+        searching_time = time.time() - searching_start_time
+        return searching_time, 0  # 返回失败标记
     analysis_end_time = time.time()
 
     searching_time = analysis_start_time - searching_start_time
@@ -775,23 +835,40 @@ def analyze_cve_lst(cve_lst, output_dir, app_name):
     total_analysis_time = 0
 
     for cve in cve_lst:
-        logging.info(f"Analyzing {cve}")
-        if not os.path.exists(f"{output_dir}/{cve}/features.json"):
-            searching_time, analysis_time = cve_analysis(cve, output_dir)
-            if analysis_time == 0:
+        try:
+            logging.info(f"Analyzing {cve}")
+            if not os.path.exists(f"{output_dir}/{cve}/features.json"):
+                try:
+                    searching_time, analysis_time = cve_analysis(cve, output_dir)
+                    if analysis_time == 0:
+                        logging.warning(f"Skipping {cve} due to failed analysis (analysis_time=0)")
+                        continue
+                    total_searching_time += searching_time
+                    total_analysis_time += analysis_time
+                    analysis_time_dict[cve] = analysis_time
+                except Exception as e:
+                    logging.error(f"Failed to analyze {cve} during cve_analysis: {e}")
+                    logging.info(f"Skipping {cve} and continuing with next CVE...")
+                    continue
+            
+            try:
+                cvss_score, cvss_category, epss_score, epss_category, final_score, exploitability, has_code = cve_classifier(cve, output_dir, mode = "specific")
+                cvss_results[cve] = cvss_category
+                cvss_scores[cve] = cvss_score
+                epss_results[cve] = epss_category
+                epss_scores[cve] = epss_score
+                pentestasst_results[cve] = exploitability
+                pentestasst_scores[cve] = final_score
+                if has_code:
+                    has_code_lst.append(cve)
+            except Exception as e:
+                logging.error(f"Failed to classify {cve} during cve_classifier: {e}")
+                logging.info(f"Skipping {cve} and continuing with next CVE...")
                 continue
-            total_searching_time += searching_time
-            total_analysis_time += analysis_time
-            analysis_time_dict[cve] = analysis_time
-        cvss_score, cvss_category, epss_score, epss_category, final_score, exploitability, has_code = cve_classifier(cve, output_dir, mode = "specific")
-        cvss_results[cve] = cvss_category
-        cvss_scores[cve] = cvss_score
-        epss_results[cve] = epss_category
-        epss_scores[cve] = epss_score
-        pentestasst_results[cve] = exploitability
-        pentestasst_scores[cve] = final_score
-        if has_code:
-            has_code_lst.append(cve)
+        except Exception as e:
+            logging.error(f"Unexpected error processing {cve}: {e}")
+            logging.info(f"Skipping {cve} and continuing with next CVE...")
+            continue
 
     with open(f"{output_dir}/analysis_time.json", 'w') as f:
         json.dump(analysis_time_dict, f, indent=4)
@@ -855,13 +932,38 @@ def get_exp_info(cve_lst = [], output_dir = "", app_name = ""):
         print("LLM_API_KEY not set")
         return
 
+    # 使用 LangChain 的 ChatOpenAI，和 recon_agent_new.py 保持一致
+    # 从配置文件读取模型和超时配置
     try:
-        Settings.llm = LangChainLLM(llm=llm)
-    except Exception:
-        # Fallback to OpenAI config if available to preserve behavior
         cve_config = config['cve']
-        print(f"Model: {cve_config['model']}")
-        Settings.llm = OpenAI(temperature=cve_config['temperature'], model=cve_config['model'])
+        model_name = cve_config.get('model', 'gpt-4o-mini')
+        timeout = config.get('models', {}).get('openai', {}).get('timeout', 180)
+        
+        # 使用 LangChain 的 ChatOpenAI，和 recon_agent_new.py 保持一致
+        langchain_llm = ChatOpenAI(
+            model=model_name,
+            temperature=cve_config.get('temperature', 0),
+            max_retries=3,  # 设置最大重试次数，和 recon_agent_new.py 保持一致
+            request_timeout=timeout  # 设置超时时间
+        )
+        
+        # 使用 LangChainLLM 包装器使 LangChain 的 LLM 兼容 LlamaIndex
+        if LangChainLLM is not None:
+            Settings.llm = LangChainLLM(llm=langchain_llm)
+            logging.info(f"LLM initialized using LangChainLLM wrapper: {model_name} (timeout={timeout}s, max_retries=3)")
+        else:
+            # 如果 LangChainLLM 不可用，回退到 LlamaIndex 的 OpenAI
+            logging.warning("LangChainLLM not available, falling back to LlamaIndex OpenAI")
+            Settings.llm = OpenAI(
+                model=model_name,
+                temperature=cve_config.get('temperature', 0),
+                timeout=timeout,
+                api_kwargs={"max_retries": 3}
+            )
+            logging.info(f"LLM initialized using LlamaIndex OpenAI: {model_name} (timeout={timeout}s)")
+    except Exception as e:
+        logging.error(f"Failed to initialize LLM: {e}")
+        raise
 
     ### Step 2: Input the CVEs to analyze
 
